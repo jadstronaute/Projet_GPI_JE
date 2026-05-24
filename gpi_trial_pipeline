@@ -1,0 +1,525 @@
+"""
+Cryo-EM Particle Picking Pipeline
+----------------------------------
+Single-file runnable version. Later to be split into modules + Typer CLI.
+
+Usage:
+    python gpi_pipeline.py path/to/micrograph.mrc
+"""
+
+import os
+import urllib.request
+
+import numpy as np
+import mrcfile
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from scipy import fft
+from scipy.ndimage import uniform_filter, gaussian_filter
+from skimage.feature import peak_local_max
+from Bio.PDB import PDBParser
+
+
+# ─────────────────────────────────────────────
+# CONFIG — edit these before running
+# ─────────────────────────────────────────────
+
+MRC_PATH       = "./14sep05c_00024sq_00006hl_00003es_c.mrc"       # path to your micrograph
+PDB_ID         = "6BDF"
+BIN_SIZE       = 5
+PIXEL_SIZE_OVERRIDE = 0.66       # recommended for more controlled results, set to None to ignore
+PAD_WIDTH      = 100             # border padding on the preprocessed image
+BLUR_SIGMA     = 1.0             # Gaussian blur applied to template
+THRESHOLD_PCT  = 0.5             # fraction of max NCC score to use as threshold
+MIN_DISTANCE   = 20              # minimum pixel separation between peaks
+MARGIN         = 100             # border pixels to ignore in peak detection
+DIMENSIONS     = 2               # 1=XY only, 2=XY+XZ, 3=XY+XZ+YZ
+PDB_CACHE_DIR  = "PDB_cache"
+PROJ_CACHE_DIR = "Projection_cache"
+OUTPUT_DIR     = "output"
+
+
+# ─────────────────────────────────────────────
+# 1. MRC LOADING  (preprocess.py later)
+# ─────────────────────────────────────────────
+
+def load_mrc_micrograph(mrc_path: str) -> tuple:
+    if not os.path.exists(mrc_path):
+        raise FileNotFoundError(f"MRC file not found: {mrc_path}")
+
+    print(f"-> Opening MRC file: {mrc_path}")
+
+    with mrcfile.open(mrc_path, mode='r', permissive=True) as mrc:
+        pixel_size = float(mrc.voxel_size.x)
+        raw_data   = mrc.data
+
+        if raw_data.ndim == 3:
+            print(f"   3D volume {raw_data.shape} — projecting to 2D (mean along Z)")
+            image_data = np.mean(raw_data, axis=0).astype(np.float32)
+        elif raw_data.ndim == 2:
+            image_data = raw_data.astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported MRC dimensionality: {raw_data.ndim}D")
+
+    # Pixel size resolved after the with block
+    if PIXEL_SIZE_OVERRIDE is not None:
+        print(f"   Using overridden pixel size: {PIXEL_SIZE_OVERRIDE} A/px")
+        pixel_size = PIXEL_SIZE_OVERRIDE
+    elif not np.isfinite(pixel_size) or pixel_size <= 0:
+        print("   Warning: invalid pixel size in header, falling back to 1.0 A/px")
+        pixel_size = 1.0
+    else:
+        print(f"   Pixel size from header: {pixel_size:.4f} A/px")
+
+    print(f"   Micrograph shape: {image_data.shape}")
+    return image_data, pixel_size
+
+# ─────────────────────────────────────────────
+# 2. PREPROCESSING  (preprocess.py later)
+# ─────────────────────────────────────────────
+
+def bin_image(image: np.ndarray, bin_size: int) -> np.ndarray:
+    """Spatial downsampling by block-averaging."""
+    if bin_size <= 1:
+        return image.copy()
+
+    h, w   = image.shape
+    new_h  = h // bin_size
+    new_w  = w // bin_size
+
+    binned = image[: new_h * bin_size, : new_w * bin_size]
+    binned = binned.reshape(new_h, bin_size, new_w, bin_size)
+    return binned.mean(axis=(1, 3)).astype(np.float32)
+
+
+def preprocess_image(image: np.ndarray, bin_size: int = 1, pad_width: int = 0) -> np.ndarray:
+    """
+    Full preprocessing pipeline:
+      1. Bin
+      2. Invert contrast  (-1 * image, so dense regions become bright)
+      3. Normalise to [0, 1]
+      4. Pad borders
+    """
+    processed = bin_image(image, bin_size)
+
+    # Invert: high-density regions appear dark in cryo-EM, flip so they are bright
+    processed = -processed
+
+    # Min-max normalise
+    lo, hi = processed.min(), processed.max()
+    if hi - lo > 1e-10:
+        processed = (processed - lo) / (hi - lo)
+    else:
+        processed = np.zeros_like(processed)
+
+    if pad_width > 0:
+        processed = np.pad(
+            processed,
+            pad_width=((pad_width, pad_width), (pad_width, pad_width)),
+            mode='constant',
+            constant_values=0,
+        )
+
+    print(f"   Preprocessed image shape: {processed.shape}")
+    return processed
+
+
+# ─────────────────────────────────────────────
+# 3. PDB DOWNLOAD + PROJECTION  (project.py later)
+# ─────────────────────────────────────────────
+
+def get_pdb_projections(
+    pdb_id: str,
+    mrc_pixel_size: float,
+    dimensions: int = 1,
+    pdb_cache_dir: str = "PDB_cache",
+    proj_cache_dir: str = "Projection_cache",
+    padding: float = 5.0,
+) -> dict:
+    """
+    Downloads PDB (cached), parses atomic coordinates, and generates
+    2D projections scaled to match the MRC pixel size.
+    """
+    os.makedirs(pdb_cache_dir, exist_ok=True)
+    os.makedirs(proj_cache_dir, exist_ok=True)
+
+    pdb_id       = pdb_id.upper()
+    cache_suffix = f"{pdb_id}_px{mrc_pixel_size:.3f}_sq"
+    dim_map      = {1: ['xy'], 2: ['xy', 'xz'], 3: ['xy', 'xz', 'yz']}
+    requested    = dim_map.get(dimensions, ['xy'])
+
+    # Check cache
+    projections  = {}
+    all_cached   = True
+    for proj in requested:
+        path = os.path.join(proj_cache_dir, f"{cache_suffix}_{proj}.npy")
+        if os.path.exists(path):
+            projections[proj] = np.load(path)
+        else:
+            all_cached = False
+
+    if all_cached:
+        print(f"-> Loaded projections for {pdb_id} from cache.")
+        return projections
+
+    # Download PDB if needed
+    pdb_path = os.path.join(pdb_cache_dir, f"{pdb_id}.pdb")
+    if not os.path.exists(pdb_path):
+        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+        print(f"-> Downloading {pdb_id} from RCSB...")
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                content = r.read().decode('utf-8')
+            with open(pdb_path, 'w') as f:
+                f.write(content)
+            print(f"   Saved to {pdb_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to download {pdb_id}: {e}")
+    else:
+        print(f"-> Using cached PDB: {pdb_path}")
+
+    # Parse coordinates
+    parser   = PDBParser(QUIET=True)
+    structure = parser.get_structure(pdb_id, pdb_path)
+    coords   = np.array([
+        atom.get_coord()
+        for chain    in structure[0].get_chains()
+        for residue  in chain.get_residues()
+        for atom     in residue.get_atoms()
+    ])
+
+    if len(coords) == 0:
+        raise ValueError(f"No atoms found in {pdb_path}")
+
+    coords -= coords.mean(axis=0)  # centre
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+
+    def _project(c1, c2):
+        span1  = (c1.max() - c1.min()) + 2 * padding
+        span2  = (c2.max() - c2.min()) + 2 * padding
+        bins   = max(int(np.round(span1 / mrc_pixel_size)),
+                     int(np.round(span2 / mrc_pixel_size)))
+        half1  = (bins * mrc_pixel_size - span1) / 2
+        half2  = (bins * mrc_pixel_size - span2) / 2
+        r1     = [c1.min() - padding - half1, c1.max() + padding + half1]
+        r2     = [c2.min() - padding - half2, c2.max() + padding + half2]
+        H, _, _ = np.histogram2d(c1, c2, bins=[bins, bins], range=[r1, r2])
+        return H / H.max() if H.max() > 0 else H
+
+    axis_map = {'xy': (x, y), 'xz': (x, z), 'yz': (y, z)}
+    for key in requested:
+        if key not in projections:   # skip already-loaded ones
+            c1, c2 = axis_map[key]
+            proj   = _project(c1, c2)
+            np.save(os.path.join(proj_cache_dir, f"{cache_suffix}_{key}.npy"), proj)
+            projections[key] = proj
+            print(f"   {key.upper()} projection shape: {proj.shape}")
+
+    print(f"-> Projections ready.")
+    return projections
+
+
+# ─────────────────────────────────────────────
+# 4. FFT NCC + PEAK DETECTION  (correlate.py later)
+# ─────────────────────────────────────────────
+
+def fft_ncc(image: np.ndarray, template: np.ndarray) -> np.ndarray:
+    """
+    Normalised cross-correlation via FFT.
+    Returns a score map the same size as image, values in [-1, 1].
+    """
+    image    = np.asarray(image,    dtype=np.float32)
+    template = np.asarray(template, dtype=np.float32)
+
+    t_h, t_w = template.shape
+
+    t_zm    = template - template.mean()
+    t_sumsq = np.sum(t_zm ** 2)
+    if t_sumsq == 0:
+        raise ValueError("Template is flat — cannot correlate.")
+
+    local_mean = uniform_filter(image, size=(t_h, t_w))
+    img_zm     = image - local_mean
+
+    s1    = image.shape[0] + t_h - 1
+    s2    = image.shape[1] + t_w - 1
+    fsize = (int(2 ** np.ceil(np.log2(s1))), int(2 ** np.ceil(np.log2(s2))))
+
+    corr  = np.real(
+        fft.ifft2(fft.fft2(img_zm, fsize) * np.conj(fft.fft2(t_zm, fsize)))
+    )
+    corr  = np.roll(corr, shift=(t_h // 2, t_w // 2), axis=(0, 1))
+    numerator = corr[: image.shape[0], : image.shape[1]]
+
+    local_sq_mean = uniform_filter(image ** 2, size=(t_h, t_w))
+    local_var     = np.maximum(local_sq_mean - local_mean ** 2, 0.0)
+    denom         = np.sqrt(local_var * (t_h * t_w) * t_sumsq)
+
+    ncc = np.where(denom > 1e-10, numerator / denom, 0.0).astype(np.float32)
+    return ncc
+
+
+def find_peaks(
+    score_map: np.ndarray,
+    threshold_pct: float = 0.5,
+    min_distance: int = 20,
+    margin: int = 0,
+) -> tuple:
+    """
+    Find local maxima in a score map.
+    Returns (coords, scores) where coords is (N, 2) array of (row, col).
+    """
+    m = score_map.copy()
+    if margin > 0:
+        m[:margin,  :]  = 0
+        m[-margin:, :]  = 0
+        m[:,  :margin]  = 0
+        m[:, -margin:]  = 0
+
+    coords = peak_local_max(m, min_distance=min_distance,
+                            threshold_abs=threshold_pct * m.max())
+    scores = score_map[coords[:, 0], coords[:, 1]]
+    return coords, scores
+
+
+# ─────────────────────────────────────────────
+# 5. EXTRACTION + SAVING  (extract.py later)
+# ─────────────────────────────────────────────
+
+def extract_patches(
+    image: np.ndarray,
+    coords: np.ndarray,
+    scores: np.ndarray,
+    box_size: int,
+) -> list:
+    """Cuts square patches from the image at each detected peak."""
+    half = box_size // 2
+    h, w = image.shape
+    particles = []
+
+    for i, ((y, x), score) in enumerate(zip(coords, scores)):
+        if y - half < 0 or y + half >= h or x - half < 0 or x + half >= w:
+            continue
+        patch = image[y - half : y + half, x - half : x + half].copy()
+        particles.append({
+            'patch' : patch.astype(np.float32),
+            'y'     : int(y),
+            'x'     : int(x),
+            'score' : float(score),
+            'index' : i + 1,
+        })
+
+    skipped = len(coords) - len(particles)
+    print(f"-> Extracted {len(particles)} particles "
+          f"({skipped} skipped — too close to border)")
+    return particles
+
+
+def save_mrcs(particles: list, output_path: str, pixel_size: float) -> None:
+    """Saves particle stack as .mrcs with correct pixel size in header."""
+    if not particles:
+        print("-> No particles to save.")
+        return
+
+    stack = np.stack([p['patch'] for p in particles], axis=0)
+    with mrcfile.new(output_path, overwrite=True) as mrc:
+        mrc.set_data(stack)
+        mrc.voxel_size = pixel_size
+
+    print(f"-> Saved {len(particles)} particles → {output_path}")
+
+
+def save_star(
+    particles: list,
+    micrograph_name: str,
+    output_path: str,
+    bin_size: int = 1,
+) -> None:
+    """Saves RELION-compatible STAR file. Coordinates are in unbinned pixel space."""
+    if not particles:
+        print("-> No particles for STAR file.")
+        return
+
+    with open(output_path, 'w') as f:
+        f.write("data_particles\n\n")
+        f.write("loop_\n")
+        f.write("_rlnMicrographName\n")
+        f.write("_rlnCoordinateX\n")
+        f.write("_rlnCoordinateY\n")
+        f.write("_rlnAutopickFigureOfMerit\n")
+        for p in particles:
+            f.write(f"{micrograph_name}\t"
+                    f"{p['x'] * bin_size:.2f}\t"
+                    f"{p['y'] * bin_size:.2f}\t"
+                    f"{p['score']:.6f}\n")
+
+    print(f"-> Saved STAR file → {output_path}")
+
+
+def save_pdf(
+    particles: list,
+    output_path: str,
+    template: np.ndarray,
+    pdb_id: str,
+    n_cols: int = 5,
+) -> None:
+    """Saves a PDF gallery: template on page 1, particle patches on page 2+."""
+    if not particles:
+        print("-> No particles for PDF.")
+        return
+
+    n      = len(particles)
+    n_rows = int(np.ceil(n / n_cols))
+
+    with PdfPages(output_path) as pdf:
+        # Page 1 — template summary
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.imshow(template, cmap='gray')
+        ax.set_title(f"Template — PDB: {pdb_id}")
+        ax.axis('off')
+        fig.suptitle(f"{n} particles extracted", fontsize=11)
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+        # Page 2 — particle gallery
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(3 * n_cols, 3 * n_rows))
+        axes = np.array(axes).ravel()
+
+        for i, p in enumerate(particles):
+            vmin = np.percentile(p['patch'], 2)
+            vmax = np.percentile(p['patch'], 98)
+            axes[i].imshow(p['patch'], cmap='gray', vmin=vmin, vmax=vmax)
+            axes[i].set_title(
+                f"#{p['index']}  ({p['x']},{p['y']})\n{p['score']:.3f}",
+                fontsize=7,
+            )
+            axes[i].axis('off')
+
+        for j in range(n, len(axes)):
+            axes[j].axis('off')
+
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+    print(f"-> Saved PDF gallery → {output_path}")
+
+
+def save_all(
+    particles: list,
+    micrograph_name: str,
+    output_dir: str,
+    pixel_size: float,
+    template: np.ndarray,
+    pdb_id: str,
+    bin_size: int = 1,
+) -> None:
+    """Saves MRCS + STAR + PDF in one call. This is what the CLI will call."""
+    os.makedirs(output_dir, exist_ok=True)
+    save_mrcs(particles, os.path.join(output_dir, "particles.mrcs"), pixel_size)
+    save_star(particles, micrograph_name, os.path.join(output_dir, "particles.star"), bin_size)
+    save_pdf(particles,  os.path.join(output_dir, "particles.pdf"),  template, pdb_id)
+    print(f"-> All outputs written to {output_dir}/")
+
+
+# ─────────────────────────────────────────────
+# 6. MAIN PIPELINE
+# ─────────────────────────────────────────────
+
+def run_pipeline():
+    print("=" * 55)
+    print("  Cryo-EM Particle Picking Pipeline")
+    print(f"  MRC  : {MRC_PATH}")
+    print(f"  PDB  : {PDB_ID}  |  Binning: {BIN_SIZE}x")
+    print("=" * 55)
+
+    # --- Load ---
+    image, pixel_size = load_mrc_micrograph(MRC_PATH)
+
+    # --- Preprocess ---
+    print("\n[1/5] Preprocessing...")
+    processed = preprocess_image(image, bin_size=BIN_SIZE, pad_width=PAD_WIDTH)
+    binned_pixel_size = pixel_size * BIN_SIZE
+    print(f"   Effective pixel size after binning: {binned_pixel_size:.3f} A/px")
+
+    # --- Project ---
+    print("\n[2/5] Getting PDB projections...")
+    projections = get_pdb_projections(
+        pdb_id        = PDB_ID,
+        mrc_pixel_size= binned_pixel_size,
+        dimensions    = DIMENSIONS,
+        pdb_cache_dir = PDB_CACHE_DIR,
+        proj_cache_dir= PROJ_CACHE_DIR,
+    )
+    template        = projections['xy']
+
+    # --- Correlate ---
+    
+    print("\n[3/5] Running FFT NCC across all projections...")
+    
+    ncc_maps = {}
+    for key, proj in projections.items():
+        proj_blurred = gaussian_filter(proj, sigma=BLUR_SIGMA)
+        ncc_maps[key] = fft_ncc(processed, proj_blurred)
+        print(f"   {key.upper()} NCC range: [{ncc_maps[key].min():.3f}, {ncc_maps[key].max():.3f}]")
+    
+    # Merge: take the best score across all projections at each pixel
+    ncc_map = np.maximum.reduce(list(ncc_maps.values()))
+    print(f"   Merged NCC range: [{ncc_map.min():.3f}, {ncc_map.max():.3f}]")
+
+    # Use the blurred version of xy as the representative template for the PDF
+    template_blurred = gaussian_filter(projections['xy'], sigma=BLUR_SIGMA)
+    box_size         = projections['xy'].shape[0] + 10
+    
+    # --- Detect peaks ---
+    print("\n[4/5] Detecting peaks...")
+    coords, scores = find_peaks(
+        ncc_map,
+        threshold_pct = THRESHOLD_PCT,
+        min_distance  = MIN_DISTANCE,
+        margin        = MARGIN + PAD_WIDTH,
+    )
+    print(f"   Found {len(coords)} peaks")
+
+    # --- Extract + Save ---
+    print("\n[5/5] Extracting patches and saving outputs...")
+    particles = extract_patches(processed, coords, scores, box_size)
+    micrograph_name = os.path.basename(MRC_PATH)
+
+    save_all(
+        particles,
+        micrograph_name = micrograph_name,
+        output_dir      = os.path.join(OUTPUT_DIR, f"{os.path.splitext(micrograph_name)[0]}_{PDB_ID}"),
+        pixel_size      = binned_pixel_size,
+        template        = template_blurred,
+        pdb_id          = PDB_ID,
+        bin_size        = BIN_SIZE,
+    )
+
+    # --- Quick visual check ---
+    print("\nShowing NCC map with detected peaks...")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    axes[0].imshow(ncc_map, cmap='hot')
+    if len(coords):
+        axes[0].plot(coords[:, 1], coords[:, 0], 'c+', markersize=8, markeredgewidth=1.5)
+    axes[0].set_title(f"NCC map — {len(coords)} detections")
+    axes[0].axis('off')
+
+    axes[1].imshow(processed, cmap='gray',
+                   vmin=np.percentile(processed, 2),
+                   vmax=np.percentile(processed, 98))
+    if len(coords):
+        axes[1].plot(coords[:, 1], coords[:, 0], 'r+', markersize=8, markeredgewidth=1.5)
+    axes[1].set_title("Preprocessed micrograph with detections")
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    run_pipeline()
