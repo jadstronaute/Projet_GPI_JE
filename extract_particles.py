@@ -6,8 +6,9 @@ projections derived from a PDB structure, extracts particle coordinates,
 and exports results as an MRC stack, RELION STAR file, and PDF gallery.
 
 Usage:
-    Edit the CONFIG section below, then run:
-        python gpi_pipeline.py
+    python gpi_pipeline.py                        # uses CONFIG values
+    python gpi_pipeline.py micrograph.mrc         # overrides MRC_PATH
+    python gpi_pipeline.py micrograph.mrc 6BDF    # overrides MRC_PATH and PDB_ID
 
 Output:
     output/<micrograph_name>_<PDB_ID>/
@@ -17,6 +18,7 @@ Output:
 """
 
 import os
+import argparse
 import urllib.request
 
 import numpy as np
@@ -33,9 +35,9 @@ from Bio.PDB import PDBParser
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-MRC_PATH            = "./14sep05c_00024sq_00006hl_00003es_c.mrc"  # path to input micrograph
-PDB_ID              = "6BDF"            # RCSB PDB identifier
-BIN_SIZE            = 5                 # spatial downsampling factor
+MRC_PATH            = "./micrograph.mrc"  # path to input micrograph
+PDB_ID              = "6BDF"             # RCSB PDB identifier
+BIN_SIZE            = 5                  # spatial downsampling factor
 PIXEL_SIZE_OVERRIDE = 0.66              # unbinned pixel size in Å; set None to read from header
 PAD_WIDTH           = 100               # padding added to micrograph borders before correlation
 BLUR_SIGMA          = 1.0               # Gaussian blur applied to projection templates
@@ -43,8 +45,8 @@ THRESHOLD_PCT       = 0.5               # minimum NCC score as fraction of map m
 MIN_DISTANCE        = 20                # minimum separation between peaks in pixels
 MARGIN              = 100               # border region excluded from peak detection (pixels)
 DIMENSIONS          = 2                 # number of projection axes: 1=XY, 2=XY+XZ, 3=XY+XZ+YZ
-OBLONG_PROJECTIONS  = {'xz'}            # projections to rotate in-plane, e.g. {'xz'}
-ROTATION_STEP       = 15                # in-plane rotation step in degrees (used if OBLONG_PROJECTIONS set)
+OBLONG_PROJECTIONS  = set()            # projections to rotate in-plane, e.g. {'xz'}, set() for none
+ROTATION_STEP       = 15               # in-plane rotation step in degrees (used if OBLONG_PROJECTIONS set)
 PDB_CACHE_DIR       = "PDB_cache"
 PROJ_CACHE_DIR      = "Projection_cache"
 OUTPUT_DIR          = "output"
@@ -241,7 +243,6 @@ def get_pdb_projections(
             int(np.round(span1 / mrc_pixel_size)),
             int(np.round(span2 / mrc_pixel_size)),
         )
-        # Expand each axis symmetrically to fill the square
         expand1 = (bins * mrc_pixel_size - span1) / 2
         expand2 = (bins * mrc_pixel_size - span2) / 2
         r1 = [c1.min() - padding - expand1, c1.max() + padding + expand1]
@@ -307,7 +308,6 @@ def fft_ncc(image: np.ndarray, template: np.ndarray) -> np.ndarray:
     corr      = np.roll(corr, shift=(t_h // 2, t_w // 2), axis=(0, 1))
     numerator = corr[: image.shape[0], : image.shape[1]]
 
-    # Local image energy over the template-sized window
     local_var = np.maximum(
         uniform_filter(image ** 2, size=(t_h, t_w)) - local_mean ** 2, 0.0
     )
@@ -505,14 +505,15 @@ def save_star(
 def save_pdf(
     particles: list[dict],
     output_path: str,
-    template: np.ndarray,
+    projections: dict[str, np.ndarray],
     pdb_id: str,
+    blur_sigma: float,
     n_cols: int = 5,
 ) -> None:
     """
     Save a PDF gallery for manual inspection.
 
-    Page 1: the template used for matching.
+    Page 1: all projection templates used for matching (blurred, as correlated).
     Page 2+: all extracted patches in a grid, labelled with index,
              coordinates, and NCC score. Display contrast is set per-patch
              using the 2nd–98th percentile range.
@@ -525,16 +526,25 @@ def save_pdf(
     n_rows = int(np.ceil(n / n_cols))
 
     with PdfPages(output_path) as pdf:
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.imshow(template, cmap='gray')
-        ax.set_title(f"Template — PDB: {pdb_id}")
-        ax.axis('off')
+        # Page 1 — one panel per projection template
+        n_proj = len(projections)
+        fig, axes = plt.subplots(1, n_proj, figsize=(4 * n_proj, 4),
+                                 squeeze=False)
+        axes = axes.ravel()
+
+        for i, (key, proj) in enumerate(projections.items()):
+            axes[i].imshow(gaussian_filter(proj, sigma=blur_sigma), cmap='gray')
+            axes[i].set_title(f"{key.upper()} projection\nPDB: {pdb_id}")
+            axes[i].axis('off')
+
         fig.suptitle(f"{n} particles extracted", fontsize=11)
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
-        axes = np.array(axes).ravel()
+        # Page 2+ — particle gallery
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows),
+                                 squeeze=False)
+        axes = axes.ravel()
 
         for i, p in enumerate(particles):
             axes[i].imshow(
@@ -563,15 +573,17 @@ def save_all(
     micrograph_name: str,
     output_dir: str,
     pixel_size: float,
-    template: np.ndarray,
+    projections: dict[str, np.ndarray],
     pdb_id: str,
+    blur_sigma: float,
     bin_size: int = 1,
 ) -> None:
     """Write MRCS, STAR, and PDF outputs to output_dir."""
     os.makedirs(output_dir, exist_ok=True)
     save_mrcs(particles, os.path.join(output_dir, "particles.mrcs"), pixel_size)
     save_star(particles, micrograph_name, os.path.join(output_dir, "particles.star"), bin_size)
-    save_pdf(particles,  os.path.join(output_dir, "particles.pdf"),  template, pdb_id)
+    save_pdf(particles,  os.path.join(output_dir, "particles.pdf"),
+             projections, pdb_id, blur_sigma)
     print(f"-> All outputs written to: {output_dir}/")
 
 
@@ -604,8 +616,7 @@ def run_pipeline() -> None:
         pdb_cache_dir  = PDB_CACHE_DIR,
         proj_cache_dir = PROJ_CACHE_DIR,
     )
-    template_blurred = gaussian_filter(projections['xy'], sigma=BLUR_SIGMA)
-    box_size         = projections['xy'].shape[0] + 10
+    box_size = projections['xy'].shape[0] + 10
 
     # 4. Correlate
     print("\n[3/5] Running FFT NCC...")
@@ -640,8 +651,9 @@ def run_pipeline() -> None:
         micrograph_name = micrograph_name,
         output_dir      = output_dir,
         pixel_size      = binned_pixel_size,
-        template        = template_blurred,
+        projections     = projections,
         pdb_id          = PDB_ID,
+        blur_sigma      = BLUR_SIGMA,
         bin_size        = BIN_SIZE,
     )
 
@@ -671,4 +683,19 @@ def run_pipeline() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Cryo-EM template matching pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("mrc_path", nargs='?', default=None,
+                        help="Path to input MRC micrograph (overrides MRC_PATH in config)")
+    parser.add_argument("pdb_id",   nargs='?', default=None,
+                        help="RCSB PDB ID (overrides PDB_ID in config)")
+    args = parser.parse_args()
+
+    if args.mrc_path:
+        MRC_PATH = args.mrc_path
+    if args.pdb_id:
+        PDB_ID = args.pdb_id
+
     run_pipeline()
