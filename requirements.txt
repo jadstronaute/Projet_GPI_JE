@@ -1,11 +1,6 @@
 numpy
+mrcfile
 matplotlib
-opencv-python
-tifffile
 scipy
-Pillow
-requests
 scikit-image
 biopython
-mrcfile
-gdown
