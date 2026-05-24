@@ -3,8 +3,8 @@
 An educational project done as an assignment in my M1 year, in the educational unit Gestion de Projet Informatique GPI  
 •ᴗ• 
 
-## Description:
-##Cryo-EM Template Matching Pipeline
+## Description:  
+## Cryo-EM Template Matching Pipeline
 
 A single-file Python pipeline for template-based particle picking in cryo-EM micrographs. Given an MRC micrograph and a PDB structure, it generates 2D projections of the structure, matches them to the micrograph via FFT normalised cross-correlation, and exports the detected particles as an MRC stack, a RELION-compatible STAR file, and a PDF gallery.
 
