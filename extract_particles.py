@@ -45,7 +45,7 @@ THRESHOLD_PCT       = 0.5               # minimum NCC score as fraction of map m
 MIN_DISTANCE        = 20                # minimum separation between peaks in pixels
 MARGIN              = 100               # border region excluded from peak detection (pixels)
 DIMENSIONS          = 2                 # number of projection axes: 1=XY, 2=XY+XZ, 3=XY+XZ+YZ
-OBLONG_PROJECTIONS  = set()            # projections to rotate in-plane, e.g. {'xz'}, set() for none
+OBLONG_PROJECTIONS  = {'xz'}            # projections to rotate in-plane, e.g. {'xz'}, set() for none
 ROTATION_STEP       = 15               # in-plane rotation step in degrees (used if OBLONG_PROJECTIONS set)
 PDB_CACHE_DIR       = "PDB_cache"
 PROJ_CACHE_DIR      = "Projection_cache"
