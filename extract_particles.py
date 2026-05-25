@@ -50,7 +50,7 @@ ROTATION_STEP       = 15               # in-plane rotation step in degrees (used
 PDB_CACHE_DIR       = "PDB_cache"
 PROJ_CACHE_DIR      = "Projection_cache"
 OUTPUT_DIR          = "output"
-
+INVERT_CONTRAST = True                  # True for standard cryo-EM (dark particles), False for bright particles
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. MRC LOADING
@@ -134,7 +134,9 @@ def preprocess_image(image: np.ndarray, bin_size: int = 1, pad_width: int = 0) -
     Returns float32 array.
     """
     processed = bin_image(image, bin_size)
-    processed = -processed
+    
+    if INVERT_CONTRAST:
+        processed = -processed
 
     lo, hi = processed.min(), processed.max()
     processed = (processed - lo) / (hi - lo) if hi - lo > 1e-10 else np.zeros_like(processed)
